@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- 1115 en decimal = 0x04F9 (Brother Industries, Ltd) -->
+    <!-- Clase 7 = USB_CLASS_PRINTER (cualquier impresora USB) -->
+    <usb-device class="7" />
     <usb-device vendor-id="1115" />
 </resources>
