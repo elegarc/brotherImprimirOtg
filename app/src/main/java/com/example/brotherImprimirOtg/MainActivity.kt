@@ -43,7 +43,9 @@ class MainActivity : AppCompatActivity() {
                     if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                         device?.let {
                             printerDevice = it
-                            tvStatus.text = "Conectado a:\n${it.productName ?: "Impresora USB"} (ID: ${it.vendorId}:${it.productId})"
+                            // Con permiso ya se puede leer el nombre de forma segura
+                            val name = try { it.productName ?: "Brother HL-L2310D" } catch (e: Exception) { "Impresora USB" }
+                            tvStatus.text = "Conectado a:\n$name\n(Vendor: ${it.vendorId}, Product: ${it.productId})"
                             btnPrintTest.isEnabled = true
                         }
                     } else {
@@ -64,7 +66,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         tvStatus = TextView(this).apply {
-            text = "Conecta la impresora por cable OTG y pulsa 'Detectar'"
+            text = "Conecta la impresora por OTG y pulsa 'Detectar'"
             textSize = 17f
             textAlignment = TextView.TEXT_ALIGNMENT_CENTER
             setPadding(0, 0, 0, 48)
@@ -94,10 +96,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun isPrinterDevice(device: UsbDevice): Boolean {
-        // 1. Brother vendorId conocido (0x04F9 = 1115)
+        // Brother Vendor ID = 1115 (0x04F9)
         if (device.vendorId == 1115) return true
 
-        // 2. Clase de interfaz estándar USB para impresoras (USB_CLASS_PRINTER = 7)
+        // Verificar si declara clase impresora (USB_CLASS_PRINTER = 7)
         for (i in 0 until device.interfaceCount) {
             val iface = device.getInterface(i)
             if (iface.interfaceClass == UsbConstants.USB_CLASS_PRINTER) {
@@ -108,47 +110,61 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun findPrinter() {
-        val deviceList = usbManager.deviceList
-        printerDevice = null
+        try {
+            val deviceList = usbManager.deviceList
+            printerDevice = null
 
-        if (deviceList.isEmpty()) {
-            tvStatus.text = "No se detecta ningún dispositivo USB.\nComprueba la conexión del cable OTG."
-            return
-        }
-
-        // Buscar primero una impresora reconocida
-        for (device in deviceList.values) {
-            if (isPrinterDevice(device)) {
-                printerDevice = device
-                break
+            if (deviceList.isEmpty()) {
+                tvStatus.text = "No se detecta ningún dispositivo USB.\nComprueba la conexión del cable OTG."
+                return
             }
-        }
 
-        // Si solo hay un único dispositivo USB conectado, asumimos que es la impresora
-        if (printerDevice == null && deviceList.size == 1) {
-            printerDevice = deviceList.values.first()
-        }
+            // Buscar la impresora Brother o dispositivo de clase impresora
+            for (device in deviceList.values) {
+                if (isPrinterDevice(device)) {
+                    printerDevice = device
+                    break
+                }
+            }
 
-        val device = printerDevice
-        if (device != null) {
-            if (!usbManager.hasPermission(device)) {
-                val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
-                val permissionIntent = PendingIntent.getBroadcast(this, 0, Intent(ACTION_USB_PERMISSION), flags)
-                usbManager.requestPermission(device, permissionIntent)
-                tvStatus.text = "Acepta la ventana de permisos USB en pantalla..."
+            // Si hay un único dispositivo conectado, seleccionarlo
+            if (printerDevice == null && deviceList.size == 1) {
+                printerDevice = deviceList.values.first()
+            }
+
+            val device = printerDevice
+            if (device != null) {
+                if (!usbManager.hasPermission(device)) {
+                    // Corrección para Android 14: especificar el paquete en el Intent
+                    val intent = Intent(ACTION_USB_PERMISSION).apply {
+                        setPackage(packageName)
+                    }
+                    val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                        PendingIntent.FLAG_MUTABLE
+                    } else {
+                        0
+                    }
+                    val permissionIntent = PendingIntent.getBroadcast(this, 0, intent, flags)
+                    
+                    usbManager.requestPermission(device, permissionIntent)
+                    tvStatus.text = "Acepta el mensaje emergente en pantalla para permitir el acceso USB..."
+                } else {
+                    val name = try { device.productName ?: "Brother" } catch (e: Exception) { "Impresora" }
+                    tvStatus.text = "Impresora lista:\n$name\n(ID: ${device.vendorId}:${device.productId})"
+                    btnPrintTest.isEnabled = true
+                }
             } else {
-                tvStatus.text = "Detectada:\n${device.productName ?: "Impresora USB"} (ID: ${device.vendorId}:${device.productId})"
-                btnPrintTest.isEnabled = true
+                tvStatus.text = "Dispositivos conectados:\n${deviceList.size} encontrados (ninguno identificado como impresora)"
             }
-        } else {
-            val info = deviceList.values.joinToString("\n") { "USB: ${it.productName ?: "Desc"} (V:${it.vendorId} P:${it.productId})" }
-            tvStatus.text = "Dispositivos conectados:\n$info\n(No reconocidos como impresora)"
+        } catch (e: Throwable) {
+            // Si ocurriera cualquier error, se muestra en pantalla sin cerrar la aplicación
+            tvStatus.text = "Error al detectar:\n${e.javaClass.simpleName}: ${e.message}"
         }
     }
 
     private fun printTestPage() {
         val device = printerDevice ?: return
-        tvStatus.text = "Generando mapa de bits y enviando..."
+        tvStatus.text = "Generando mapa de bits y enviando a la impresora..."
 
         thread {
             try {
@@ -175,7 +191,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val connection = usbManager.openDevice(device) ?: run {
-                    runOnUiThread { tvStatus.text = "Error: No se pudo abrir la comunicación USB." }
+                    runOnUiThread { tvStatus.text = "Error: No se pudo abrir la conexión USB." }
                     return@thread
                 }
 
@@ -193,7 +209,7 @@ class MainActivity : AppCompatActivity() {
 
                     val transferred = connection.bulkTransfer(outEndpoint, buffer, length, 5000)
                     if (transferred < 0) {
-                        runOnUiThread { tvStatus.text = "Fallo de transferencia USB." }
+                        runOnUiThread { tvStatus.text = "Fallo durante la transferencia de datos USB." }
                         break
                     }
                     offset += length
@@ -203,12 +219,12 @@ class MainActivity : AppCompatActivity() {
                 connection.close()
 
                 runOnUiThread {
-                    tvStatus.text = "¡Página de prueba enviada con éxito!"
+                    tvStatus.text = "¡Página enviada con éxito!\nRevisa la bandeja de la impresora."
                     Toast.makeText(this@MainActivity, "Impresión completada", Toast.LENGTH_LONG).show()
                 }
 
-            } catch (e: Exception) {
-                runOnUiThread { tvStatus.text = "Error: ${e.message}" }
+            } catch (e: Throwable) {
+                runOnUiThread { tvStatus.text = "Error al imprimir:\n${e.message}" }
             }
         }
     }
@@ -229,15 +245,14 @@ class MainActivity : AppCompatActivity() {
         canvas.drawText("IMPRESIÓN DIRECTA OTG", 80f, 180f, paint)
         paint.textSize = 30f
         canvas.drawText("Modelo: Brother HL-L2310D", 80f, 260f, paint)
-        canvas.drawText("Conexión OTG nativa completada", 80f, 320f, paint)
+        canvas.drawText("FacturaScripts - Conexión OTG OK", 80f, 320f, paint)
         return bitmap
     }
 
     private fun encodeBitmapToBrotherRaster(bitmap: Bitmap): ByteArray {
         val stream = ByteArrayOutputStream()
-        // Secuencia inicial de reinicio y modo raster Brother
-        stream.write(byteArrayOf(0x1B, 0x40)) 
-        stream.write(byteArrayOf(0x1B, 0x69, 0x61, 0x01)) 
+        stream.write(byteArrayOf(0x1B, 0x40)) // ESC @ (Reset)
+        stream.write(byteArrayOf(0x1B, 0x69, 0x61, 0x01)) // Entrar en modo Raster Brother
 
         val width = bitmap.width
         val height = bitmap.height
@@ -267,15 +282,15 @@ class MainActivity : AppCompatActivity() {
                 lineBuffer[bytesPerLine - 1] = currentByte.toByte()
             }
 
-            stream.write(0x67) // 'g'
+            stream.write(0x67) // Comando 'g' (enviar línea raster)
             stream.write(0x00)
             stream.write(bytesPerLine and 0xFF)
             stream.write((bytesPerLine shr 8) and 0xFF)
             stream.write(lineBuffer)
         }
 
-        stream.write(0x0C) // Form Feed (expulsar página)
-        stream.write(byteArrayOf(0x1B, 0x69, 0x61, 0x00)) 
+        stream.write(0x0C) // Form Feed (expulsar papel)
+        stream.write(byteArrayOf(0x1B, 0x69, 0x61, 0x00)) // Salir de modo Raster
         return stream.toByteArray()
     }
 
