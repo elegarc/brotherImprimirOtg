@@ -97,7 +97,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         tvLog = TextView(this).apply {
-            text = "--- CONSOLA PCL RASTER PURO ---\n"
+            text = "--- PROTOCOLO EXACTO BRLASER ---\n"
             textSize = 12f
             typeface = Typeface.MONOSPACE
             setTextColor(Color.parseColor("#00FF00"))
@@ -168,7 +168,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun printTestPage() {
         val device = printerDevice ?: return
-        log("Construyendo flujo PCL Raster continuo...")
+        log("Construyendo flujo raster definitivo brlaser...")
 
         thread {
             try {
@@ -201,7 +201,7 @@ class MainActivity : AppCompatActivity() {
 
                 connection.claimInterface(usbInterface, true)
 
-                val printData = generateSolidPclRasterStream()
+                val printData = generateRealBrlaserStream()
                 log("Flujo generado: ${printData.size} bytes (${printData.size / 1024} KB).")
 
                 val chunkSize = 16384
@@ -228,7 +228,7 @@ class MainActivity : AppCompatActivity() {
 
                 connection.releaseInterface(usbInterface)
                 connection.close()
-                log("Puerto cerrado. Revisa la hoja física.")
+                log("Puerto cerrado. Comprobando salida...")
 
             } catch (e: Throwable) {
                 log("EXCEPCIÓN: ${e.message}")
@@ -236,37 +236,57 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun generateSolidPclRasterStream(): ByteArray {
+    private fun encodeLineLiteralSafe(lineBuffer: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        var pos = 0
+        while (pos < lineBuffer.size) {
+            val chunk = Math.min(64, lineBuffer.size - pos)
+            out.write(chunk - 1) // Modo literal 0..63
+            out.write(lineBuffer, pos, chunk)
+            pos += chunk
+        }
+        return out.toByteArray()
+    }
+
+    private fun flushBlock(stream: ByteArrayOutputStream, blockBuffer: ByteArrayOutputStream, numLines: Int) {
+        if (numLines <= 0) return
+        val data = blockBuffer.toByteArray()
+        stream.write(0x40) // '@'
+        stream.write((data.size shr 8) and 0xFF)
+        stream.write(data.size and 0xFF)
+        stream.write(numLines and 0xFF)
+        stream.write(data)
+        blockBuffer.reset()
+    }
+
+    private fun generateRealBrlaserStream(): ByteArray {
         val stream = ByteArrayOutputStream()
 
         // 1. Cabecera PJL
-        val pjlHeader = "\u001b%-12345X@PJL JOB NAME=\"JOGARI\"\r\n" +
-                "@PJL SET RESOLUTION = 600\r\n" +
-                "@PJL SET PAPER = A4\r\n" +
-                "@PJL ENTER LANGUAGE = PCL\r\n"
-        stream.write(pjlHeader.toByteArray(Charsets.US_ASCII))
+        val jobHeader = "\u001b%-12345X@PJL\n" +
+                "@PJL JOB NAME=\"brlaser\"\n" +
+                "@PJL SET RESOLUTION = 600\n" +
+                "@PJL SET PAPER = A4\n" +
+                "@PJL ENTER LANGUAGE = PCL\n"
+        stream.write(jobHeader.toByteArray(Charsets.US_ASCII))
 
-        // 2. Inicialización PCL:
-        // ESC E       -> Reset PCL solo al inicio
+        // 2. Cabecera PCL combinada:
+        // ESC E       -> Reset PCL
         // ESC & l 26A -> Papel A4
-        // ESC & l 0O  -> Retrato (Portrait)
+        // ESC & l 0O  -> Portrait
         // ESC & l 0E  -> Margen superior 0
-        // ESC * p 0 x 0 Y -> Posicionar cursor en (0, 0)
-        // ESC * t 600 R   -> Resolución 600 DPI
-        // ESC * r 0 A     -> Iniciar gráficos raster en el cursor
-        // ESC * b 0 M     -> Modo 0: Datos sin compresión (Raw bytes)
-        val pclInit = "\u001bE" +
-                "\u001b&l26A" +
-                "\u001b&l0O" +
-                "\u001b&l0E" +
-                "\u001b*p0x0Y" +
+        // ESC * t 600 R -> 600 DPI
+        // ESC * r 1 A -> ¡INICIO GRÁFICOS RASTER! (Evita desbordar a 5 páginas)
+        // ESC * b 1027 M -> MODO PROPIETARIO BROTHER
+        val pageHeader = "\u001bE" +
+                "\u001b&l26a0o0E" +
                 "\u001b*t600R" +
-                "\u001b*r0A" +
-                "\u001b*b0M"
-        stream.write(pclInit.toByteArray(Charsets.US_ASCII))
+                "\u001b*r1A" +
+                "\u001b*b1027M"
+        stream.write(pageHeader.toByteArray(Charsets.US_ASCII))
 
         val width = 4736        // 592 bytes por línea
-        val totalHeight = 1500  // 1500 líneas = 2.5 pulgadas de contenido visible
+        val totalHeight = 1200  // Altura del bloque visible
         val bytesPerLine = width / 8
 
         val bitmap = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.RGB_565)
@@ -275,32 +295,30 @@ class MainActivity : AppCompatActivity() {
 
         val paint = Paint().apply {
             color = Color.BLACK
-            isAntiAlias = false // Evitar degradados grises
+            isAntiAlias = false
         }
 
-        // BLOQUE 1: Franja negra sólida gigante (imposible no ver el tóner)
+        // Bloque visual claro: rectángulo sólido + textos
         canvas.drawRect(200f, 150f, 4500f, 400f, paint)
 
-        // Texto en blanco sobre la franja negra
         paint.color = Color.WHITE
         paint.textSize = 140f
         paint.typeface = Typeface.DEFAULT_BOLD
         canvas.drawText("PANADERÍA JOGARI", 300f, 330f, paint)
 
-        // BLOQUE 2: Texto en negro
         paint.color = Color.BLACK
         paint.textSize = 100f
-        canvas.drawText("Prueba PCL Directa - FacturaScripts OK", 200f, 580f, paint)
+        canvas.drawText("Prueba brlaser 1027M con Raster Activo", 200f, 580f, paint)
         paint.textSize = 80f
-        canvas.drawText("Impresora: Brother HL-L2310D (600 DPI)", 200f, 720f, paint)
+        canvas.drawText("Brother HL-L2310D OK", 200f, 720f, paint)
 
-        // Línea divisoria gruesa
         canvas.drawRect(200f, 800f, 4500f, 840f, paint)
 
         val pixels = IntArray(width)
-        val rowHeader = "\u001b*b${bytesPerLine}W".toByteArray(Charsets.US_ASCII)
+        val blockBuffer = ByteArrayOutputStream()
+        var linesInBlock = 0
 
-        // 3. Enviar absolutamente TODAS las líneas con ESC * b 592 W (sin usar comandos de salto 'Y')
+        // 3. Empaquetar líneas en bloques 0x40 (25 líneas por bloque)
         for (y in 0 until totalHeight) {
             bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
 
@@ -323,14 +341,21 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            stream.write(rowHeader)
-            stream.write(lineBuffer)
+            val encodedLine = encodeLineLiteralSafe(lineBuffer)
+            blockBuffer.write(encodedLine)
+            linesInBlock++
+
+            if (linesInBlock == 25) {
+                flushBlock(stream, blockBuffer, linesInBlock)
+                linesInBlock = 0
+            }
         }
+
+        flushBlock(stream, blockBuffer, linesInBlock)
         bitmap.recycle()
 
-        // 4. Fin de gráficos (*rB) y expulsión de página (0x0C).
-        // ¡OJO!: NO incluimos \u001bE aquí para no borrar el buffer antes de imprimir.
-        val footer = "\u001b*rB\u000c\u001b%-12345X@PJL EOJ\r\n\u001b%-12345X"
+        // 4. Salida de modo gráfico (ESC * r B), expulsión (Form Feed 0x0C) y salida de 1027M
+        val footer = "\u001b*rB\u000c\u001b*b0M\u001b%-12345X@PJL EOJ\n\u001b%-12345X"
         stream.write(footer.toByteArray(Charsets.US_ASCII))
 
         return stream.toByteArray()
