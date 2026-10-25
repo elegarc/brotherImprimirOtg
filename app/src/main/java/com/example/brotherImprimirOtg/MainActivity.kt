@@ -236,32 +236,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    /**
-     * Codifica una línea usando fragmentos literales de máximo 64 bytes (< 127 para evitar el byte de overflow 0x7F de brlaser)
-     */
+    // Codifica una linea usando fragmentos literales de maximo 64 bytes (evita overflow de brlaser)
     private fun encodeLineLiteralSafe(lineBuffer: ByteArray): ByteArray {
         val out = ByteArrayOutputStream()
         var pos = 0
         while (pos < lineBuffer.size) {
             val chunk = Math.min(64, lineBuffer.size - pos)
-            out.write(chunk - 1) // 0..63 (nunca llega a 127 / 0x7F)
+            out.write(chunk - 1) // 0..63
             out.write(lineBuffer, pos, chunk)
             pos += chunk
         }
         return out.toByteArray()
     }
 
-    /**
-     * Escribe un bloque de líneas en el flujo con la cabecera exacta de 4 bytes de brlaser (block.h):
-     * [0x40] [size >> 8] [size & 0xFF] [num_lines] [datos...]
-     */
+    // Escribe un bloque de lineas con cabecera de 4 bytes de brlaser: 0x40, size high, size low, num_lines
     private fun flushBlock(stream: ByteArrayOutputStream, blockBuffer: ByteArrayOutputStream, numLines: Int) {
         if (numLines <= 0) return
         val data = blockBuffer.toByteArray()
         stream.write(0x40) // '@'
         stream.write((data.size shr 8) and 0xFF)
         stream.write(data.size and 0xFF)
-        stream.write(numLines and 0xFF) // 4.º byte obligatorio: número de líneas en este bloque
+        stream.write(numLines and 0xFF) // 4o byte obligatorio: numero de lineas
         stream.write(data)
         blockBuffer.reset()
     }
@@ -269,7 +264,7 @@ class MainActivity : AppCompatActivity() {
     private fun generateExactBrlaser1027MStream(): ByteArray {
         val stream = ByteArrayOutputStream()
 
-        // 1. Cabecera de trabajo PJL + Reset PCL inicial (idéntico a job.cc de brlaser)
+        // 1. Cabecera de trabajo PJL + Reset PCL inicial (identico a job.cc de brlaser)
         val jobHeader = "\u001b%-12345X@PJL\n" +
                 "@PJL JOB NAME=\"brlaser\"\n" +
                 "@PJL SET RAS1200MODE = OFF\n" +
@@ -284,7 +279,7 @@ class MainActivity : AppCompatActivity() {
                 "\u001bE"
         stream.write(jobHeader.toByteArray(Charsets.US_ASCII))
 
-        // 2. Cabecera de página PCL + entrada en modo 1027M (idéntico a write_page_header en job.cc)
+        // 2. Cabecera de pagina PCL + entrada en modo 1027M (write_page_header en job.cc)
         val pageHeader = "\u001b&l1X" +
                 "\u001b&l0O" +
                 "\u001b&l0E" +
@@ -307,7 +302,6 @@ class MainActivity : AppCompatActivity() {
             isAntiAlias = true
         }
 
-        // Dibujar texto dejando un margen superior limpio dentro del propio bitmap
         canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 250f, 450f, paint)
         paint.textSize = 100f
         canvas.drawText("Impresión OTG Directa - FacturaScripts", 250f, 650f, paint)
@@ -320,7 +314,7 @@ class MainActivity : AppCompatActivity() {
         val blockBuffer = ByteArrayOutputStream()
         var linesInBlock = 0
 
-        // 3. Empaquetar TODAS las líneas en bloques 0x40 (máximo 25 líneas por bloque ~15 KB <= 16350 bytes)
+        // 3. Empaquetar lineas en bloques 0x40 (25 lineas por bloque)
         for (y in 0 until totalHeight) {
             bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
 
@@ -347,19 +341,17 @@ class MainActivity : AppCompatActivity() {
             blockBuffer.write(encodedLine)
             linesInBlock++
 
-            // Volcar bloque cada 25 líneas (unos 15.050 bytes, dentro del límite de 16.350 bytes de brlaser)
             if (linesInBlock == 25) {
                 flushBlock(stream, blockBuffer, linesInBlock)
                 linesInBlock = 0
             }
         }
 
-        // Volcar líneas restantes del último bloque
         flushBlock(stream, blockBuffer, linesInBlock)
         bitmap.recycle()
 
-        // 4. Fin de página en el orden exacto de job.cc: PRIMERO Form Feed (0x0C) y DESPUÉS salir con \u001b*b0M
-        stream.write(0x0C) // '\f'
+        // 4. Fin de pagina: primero Form Feed (0x0C) y despues salir con \u001b*b0M
+        stream.write(0x0C)
         stream.write("\u001b*b0M".toByteArray(Charsets.US_ASCII))
 
         // 5. Cierre de trabajo PJL
