@@ -97,7 +97,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         tvLog = TextView(this).apply {
-            text = "--- CONSOLA BROTHER MODO 1027M ---\n"
+            text = "--- CONSOLA BRLASER 1027M (BLOQUES 0x40) ---\n"
             textSize = 12f
             typeface = Typeface.MONOSPACE
             setTextColor(Color.parseColor("#00FF00"))
@@ -168,7 +168,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun printTestPage() {
         val device = printerDevice ?: return
-        log("Generando flujo con modo propietario 1027M...")
+        log("Construyendo bloques 0x40 de 4 bytes (brlaser)...")
 
         thread {
             try {
@@ -201,8 +201,8 @@ class MainActivity : AppCompatActivity() {
 
                 connection.claimInterface(usbInterface, true)
 
-                val printData = generateBrother1027MStream()
-                log("Flujo 1027M generado: ${printData.size} bytes.")
+                val printData = generateExactBrlaser1027MStream()
+                log("Flujo generado: ${printData.size} bytes (${printData.size / 1024} KB).")
 
                 val chunkSize = 16384
                 var offset = 0
@@ -228,7 +228,7 @@ class MainActivity : AppCompatActivity() {
 
                 connection.releaseInterface(usbInterface)
                 connection.close()
-                log("Puerto cerrado. Comprueba el texto en la página impresa.")
+                log("Puerto cerrado. Esperando hoja impresa...")
 
             } catch (e: Throwable) {
                 log("EXCEPCIÓN: ${e.message}")
@@ -237,90 +237,103 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Empaqueta una línea de 592 bytes en formato literal PackBits (bloques de hasta 128 bytes)
+     * Codifica una línea usando fragmentos literales de máximo 64 bytes (< 127 para evitar el byte de overflow 0x7F de brlaser)
      */
-    private fun packBitsLiteral(lineBuffer: ByteArray): ByteArray {
-        val packed = ByteArrayOutputStream()
+    private fun encodeLineLiteralSafe(lineBuffer: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
         var pos = 0
         while (pos < lineBuffer.size) {
-            val chunk = Math.min(128, lineBuffer.size - pos)
-            packed.write(chunk - 1) // 0..127 indica N+1 bytes literales en PackBits
-            packed.write(lineBuffer, pos, chunk)
+            val chunk = Math.min(64, lineBuffer.size - pos)
+            out.write(chunk - 1) // 0..63 (nunca llega a 127 / 0x7F)
+            out.write(lineBuffer, pos, chunk)
             pos += chunk
         }
-        return packed.toByteArray()
+        return out.toByteArray()
     }
 
     /**
-     * Genera el flujo exacto del driver brlaser usando el modo propietario Brother 1027M
+     * Escribe un bloque de líneas en el flujo con la cabecera exacta de 4 bytes de brlaser (block.h):
+     * [0x40] [size >> 8] [size & 0xFF] [num_lines] [datos...]
      */
-    private fun generateBrother1027MStream(): ByteArray {
+    private fun flushBlock(stream: ByteArrayOutputStream, blockBuffer: ByteArrayOutputStream, numLines: Int) {
+        if (numLines <= 0) return
+        val data = blockBuffer.toByteArray()
+        stream.write(0x40) // '@'
+        stream.write((data.size shr 8) and 0xFF)
+        stream.write(data.size and 0xFF)
+        stream.write(numLines and 0xFF) // 4.º byte obligatorio: número de líneas en este bloque
+        stream.write(data)
+        blockBuffer.reset()
+    }
+
+    private fun generateExactBrlaser1027MStream(): ByteArray {
         val stream = ByteArrayOutputStream()
 
-        // 1. Cabecera PJL que ya activa correctamente tu impresora y saca 1 sola hoja
-        val pjlHeader = "\u001b%-12345X@PJL JOB NAME=\"JOGARI\"\r\n" +
-                "@PJL SET RAS1200MODE = OFF\r\n" +
-                "@PJL SET RESOLUTION = 600\r\n" +
-                "@PJL SET ECONOMODE = OFF\r\n" +
-                "@PJL SET SOURCETRAY = TRAY1\r\n" +
-                "@PJL SET MEDIATYPE = REGULAR\r\n" +
-                "@PJL SET PAGEPROTECT = AUTO\r\n" +
-                "@PJL SET ORIENTATION = PORTRAIT\r\n" +
-                "@PJL SET PAPER = A4\r\n" +
-                "@PJL ENTER LANGUAGE = PCL\r\n"
-        stream.write(pjlHeader.toByteArray(Charsets.US_ASCII))
+        // 1. Cabecera de trabajo PJL + Reset PCL inicial (idéntico a job.cc de brlaser)
+        val jobHeader = "\u001b%-12345X@PJL\n" +
+                "@PJL JOB NAME=\"brlaser\"\n" +
+                "@PJL SET RAS1200MODE = OFF\n" +
+                "@PJL SET RESOLUTION = 600\n" +
+                "@PJL SET ECONOMODE = OFF\n" +
+                "@PJL SET SOURCETRAY = AUTO\n" +
+                "@PJL SET MEDIATYPE = REGULAR\n" +
+                "@PJL SET PAGEPROTECT = AUTO\n" +
+                "@PJL SET ORIENTATION = PORTRAIT\n" +
+                "@PJL SET PAPER = A4\n" +
+                "@PJL ENTER LANGUAGE = PCL\n" +
+                "\u001bE"
+        stream.write(jobHeader.toByteArray(Charsets.US_ASCII))
 
-        // 2. Activación del motor gráfico propietario de Brother:
-        // \u001bE        -> Reset PCL
-        // \u001b&l26a0o0E -> A4, Portrait, Top margin 0
-        // \u001b*t600R   -> 600 DPI
-        // \u001b*b1027M  -> MODO PROPIETARIO BROTHER RASTER (Clave en brlaser)
-        val brotherInit = "\u001bE\u001b&l26a0o0E\u001b*t600R\u001b*b1027M"
-        stream.write(brotherInit.toByteArray(Charsets.US_ASCII))
+        // 2. Cabecera de página PCL + entrada en modo 1027M (idéntico a write_page_header en job.cc)
+        val pageHeader = "\u001b&l1X" +
+                "\u001b&l0O" +
+                "\u001b&l0E" +
+                "\u001b&l26A" +
+                "\u001b*t600R" +
+                "\u001b*b1027M"
+        stream.write(pageHeader.toByteArray(Charsets.US_ASCII))
 
         val width = 4736        // 592 bytes por fila
-        val textHeight = 700
+        val totalHeight = 1200  // Margen superior + texto
         val bytesPerLine = width / 8
 
-        val bitmap = Bitmap.createBitmap(width, textHeight, Bitmap.Config.RGB_565)
+        val bitmap = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.RGB_565)
         val canvas = android.graphics.Canvas(bitmap)
         canvas.drawColor(Color.WHITE)
 
         val paint = Paint().apply {
             color = Color.BLACK
-            textSize = 130f
+            textSize = 140f
             isAntiAlias = true
         }
 
-        canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 250f, 250f, paint)
-        paint.textSize = 90f
-        canvas.drawText("Brother HL-L2310D - Modo 1027M OK", 250f, 420f, paint)
-        paint.strokeWidth = 15f
-        canvas.drawLine(250f, 520f, 4400f, 520f, paint)
+        // Dibujar texto dejando un margen superior limpio dentro del propio bitmap
+        canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 250f, 450f, paint)
+        paint.textSize = 100f
+        canvas.drawText("Impresión OTG Directa - FacturaScripts", 250f, 650f, paint)
+        paint.textSize = 85f
+        canvas.drawText("Brother HL-L2310D (Bloques 0x40 de 4 bytes)", 250f, 820f, paint)
+        paint.strokeWidth = 16f
+        canvas.drawLine(250f, 950f, 4400f, 950f, paint)
 
         val pixels = IntArray(width)
+        val blockBuffer = ByteArrayOutputStream()
+        var linesInBlock = 0
 
-        // Margen superior: 150 líneas vacías usando 'y' (0x79)
-        for (i in 0 until 150) {
-            stream.write(0x79)
-        }
-
-        // 3. BLOQUE 1: Envío usando el formato brlaser de paquete con cabecera '@' (0x40)
-        for (y in 0 until textHeight) {
+        // 3. Empaquetar TODAS las líneas en bloques 0x40 (máximo 25 líneas por bloque ~15 KB <= 16350 bytes)
+        for (y in 0 until totalHeight) {
             bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
 
             val lineBuffer = ByteArray(bytesPerLine)
             var currentByte = 0
             var bitIndex = 7
             var bytePos = 0
-            var isBlank = true
 
             for (x in 0 until width) {
                 val pixel = pixels[x]
                 val lum = (Color.red(pixel) * 0.299 + Color.green(pixel) * 0.587 + Color.blue(pixel) * 0.114).toInt()
                 if (lum < 128) {
                     currentByte = currentByte or (1 shl bitIndex)
-                    isBlank = false
                 }
                 bitIndex--
                 if (bitIndex < 0) {
@@ -330,65 +343,28 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            if (isBlank) {
-                stream.write(0x79) // 'y' = 1 línea en blanco
-            } else {
-                val packed = packBitsLiteral(lineBuffer)
-                // En modo 1027M: '@' (0x40) + longitud en Big Endian + datos PackBits
-                stream.write(0x40) // '@'
-                stream.write((packed.size shr 8) and 0xFF)
-                stream.write(packed.size and 0xFF)
-                stream.write(packed)
+            val encodedLine = encodeLineLiteralSafe(lineBuffer)
+            blockBuffer.write(encodedLine)
+            linesInBlock++
+
+            // Volcar bloque cada 25 líneas (unos 15.050 bytes, dentro del límite de 16.350 bytes de brlaser)
+            if (linesInBlock == 25) {
+                flushBlock(stream, blockBuffer, linesInBlock)
+                linesInBlock = 0
             }
         }
 
-        // Separación de 100 líneas en blanco
-        for (i in 0 until 100) {
-            stream.write(0x79)
-        }
-
-        // 4. BLOQUE 2: Envío del mismo bloque usando 'w' (0x77) dentro de 1027M por compatibilidad
-        for (y in 0 until textHeight) {
-            bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
-
-            val lineBuffer = ByteArray(bytesPerLine)
-            var currentByte = 0
-            var bitIndex = 7
-            var bytePos = 0
-            var isBlank = true
-
-            for (x in 0 until width) {
-                val pixel = pixels[x]
-                val lum = (Color.red(pixel) * 0.299 + Color.green(pixel) * 0.587 + Color.blue(pixel) * 0.114).toInt()
-                if (lum < 128) {
-                    currentByte = currentByte or (1 shl bitIndex)
-                    isBlank = false
-                }
-                bitIndex--
-                if (bitIndex < 0) {
-                    lineBuffer[bytePos++] = currentByte.toByte()
-                    currentByte = 0
-                    bitIndex = 7
-                }
-            }
-
-            if (isBlank) {
-                stream.write(0x79)
-            } else {
-                val packed = packBitsLiteral(lineBuffer)
-                // 'w' (0x77) + longitud en Big Endian + datos PackBits
-                stream.write(0x77)
-                stream.write((packed.size shr 8) and 0xFF)
-                stream.write(packed.size and 0xFF)
-                stream.write(packed)
-            }
-        }
-
+        // Volcar líneas restantes del último bloque
+        flushBlock(stream, blockBuffer, linesInBlock)
         bitmap.recycle()
 
-        // 5. Salir de modo 1027M (\u001b*b0M), expulsar la hoja (\u000c), reset (\u001bE) y cerrar PJL
-        val footer = "\u001b*b0M\u000c\u001bE\u001b%-12345X@PJL EOJ\r\n\u001b%-12345X"
-        stream.write(footer.toByteArray(Charsets.US_ASCII))
+        // 4. Fin de página en el orden exacto de job.cc: PRIMERO Form Feed (0x0C) y DESPUÉS salir con \u001b*b0M
+        stream.write(0x0C) // '\f'
+        stream.write("\u001b*b0M".toByteArray(Charsets.US_ASCII))
+
+        // 5. Cierre de trabajo PJL
+        val jobFooter = "\u001bE\u001b%-12345X@PJL EOJ\n\u001b%-12345X"
+        stream.write(jobFooter.toByteArray(Charsets.US_ASCII))
 
         return stream.toByteArray()
     }
