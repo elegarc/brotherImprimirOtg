@@ -17,7 +17,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
-import java.io.ByteArrayOutputStream
 import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity() {
@@ -47,11 +46,12 @@ class MainActivity : AppCompatActivity() {
                         device?.let {
                             printerDevice = it
                             log("PERMISO CONCEDIDO para USB ID: ${it.vendorId}:${it.productId}")
-                            tvStatus.text = "Conectado a:\n${it.productName ?: "Brother HL-L2310D"}"
+                            val name = try { it.productName ?: "Brother HL-L2310D" } catch (e: Exception) { "Impresora Brother" }
+                            tvStatus.text = "Conectado a:\n$name"
                             btnPrintTest.isEnabled = true
                         }
                     } else {
-                        log("ERROR: Permiso USB denegado.")
+                        log("ERROR: Permiso USB denegado por el usuario.")
                         tvStatus.text = "Permiso USB denegado"
                     }
                 }
@@ -82,7 +82,7 @@ class MainActivity : AppCompatActivity() {
         layout.addView(btnConnect)
 
         btnPrintTest = Button(this).apply {
-            text = "2. Imprimir Página de Prueba"
+            text = "2. Imprimir Página de Prueba (NDK brlaser)"
             isEnabled = false
             setOnClickListener { printTestPage() }
         }
@@ -97,7 +97,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         tvLog = TextView(this).apply {
-            text = "--- PROTOCOLO EXACTO BRLASER ---\n"
+            text = "--- CONSOLA BRLASER C++ (NDK JNI) ---\n"
             textSize = 12f
             typeface = Typeface.MONOSPACE
             setTextColor(Color.parseColor("#00FF00"))
@@ -131,7 +131,7 @@ class MainActivity : AppCompatActivity() {
             printerDevice = null
 
             if (deviceList.isEmpty()) {
-                log("No se detecta ningún dispositivo USB.")
+                log("No se detecta ningún dispositivo conectado al puerto OTG.")
                 return
             }
 
@@ -141,25 +141,36 @@ class MainActivity : AppCompatActivity() {
                     log("-> Impresora Brother detectada (V:${device.vendorId} P:${device.productId})")
                     break
                 }
+                for (i in 0 until device.interfaceCount) {
+                    if (device.getInterface(i).interfaceClass == UsbConstants.USB_CLASS_PRINTER) {
+                        printerDevice = device
+                        log("-> Dispositivo con interfaz de impresora detectado (V:${device.vendorId})")
+                        break
+                    }
+                }
             }
 
             if (printerDevice == null && deviceList.size == 1) {
                 printerDevice = deviceList.values.first()
+                log("-> Seleccionado el único USB disponible por descarte.")
             }
 
             val device = printerDevice
             if (device != null) {
                 if (!usbManager.hasPermission(device)) {
-                    log("Solicitando permiso USB...")
+                    log("Solicitando permiso a Android para acceder al USB...")
                     val intent = Intent(ACTION_USB_PERMISSION).apply { setPackage(packageName) }
                     val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
                     val permissionIntent = PendingIntent.getBroadcast(this, 0, intent, flags)
                     usbManager.requestPermission(device, permissionIntent)
                 } else {
-                    log("Permiso USB listo.")
-                    tvStatus.text = "Impresora lista:\n${device.productName ?: "Brother HL-L2310D"}"
+                    log("Permiso USB ya estaba concedido.")
+                    val name = try { device.productName ?: "Brother HL-L2310D" } catch (e: Exception) { "Impresora Brother" }
+                    tvStatus.text = "Impresora lista:\n$name"
                     btnPrintTest.isEnabled = true
                 }
+            } else {
+                log("No se encontró ningún dispositivo compatible.")
             }
         } catch (e: Throwable) {
             log("Error en findPrinter: ${e.message}")
@@ -168,10 +179,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun printTestPage() {
         val device = printerDevice ?: return
-        log("Construyendo flujo raster definitivo brlaser...")
+        log("Generando lienzo gráfico en Android (RGB_565)...")
 
         thread {
             try {
+                // 1. Localizar interfaz y Endpoint BULK OUT
                 var usbInterface: UsbInterface? = null
                 var outEndpoint: UsbEndpoint? = null
 
@@ -195,20 +207,59 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 val connection = usbManager.openDevice(device) ?: run {
-                    log("ERROR: No se pudo abrir el dispositivo USB.")
+                    log("ERROR: No se pudo abrir la conexión con el dispositivo USB.")
                     return@thread
                 }
 
                 connection.claimInterface(usbInterface, true)
 
-                val printData = generateRealBrlaserStream()
-                log("Flujo generado: ${printData.size} bytes (${printData.size / 1024} KB).")
+                // 2. Crear Bitmap en formato RGB_565 (requerido por el decodificador nativo C++)
+                val width = 4736        // Ancho imprimible A4 a 600 DPI (592 bytes por línea)
+                val totalHeight = 1500  // Altura del bloque de prueba
+                val bitmap = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.RGB_565)
+                val canvas = android.graphics.Canvas(bitmap)
+                canvas.drawColor(Color.WHITE)
 
+                val paint = Paint().apply {
+                    color = Color.BLACK
+                    isAntiAlias = false
+                }
+
+                // Dibujar bloque negro macizo superior
+                canvas.drawRect(200f, 150f, 4500f, 420f, paint)
+
+                // Texto en blanco dentro del bloque negro
+                paint.color = Color.WHITE
+                paint.textSize = 140f
+                paint.typeface = Typeface.DEFAULT_BOLD
+                canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 300f, 340f, paint)
+
+                // Bloque de texto en negro
+                paint.color = Color.BLACK
+                paint.textSize = 100f
+                canvas.drawText("Prueba con motor nativo C++ brlaser (NDK JNI)", 200f, 600f, paint)
+                paint.textSize = 80f
+                canvas.drawText("Brother HL-L2310D - FacturaScripts OTG", 200f, 740f, paint)
+
+                // Línea divisoria
+                canvas.drawRect(200f, 820f, 4500f, 860f, paint)
+
+                log("Ejecutando algoritmo de compresión nativo en C++ (BrlaserBridge)...")
+                val startTimeRender = System.currentTimeMillis()
+                
+                // Llamada a la función externa C++ mediante JNI
+                val printData = BrlaserBridge.renderPage(bitmap)
+                bitmap.recycle()
+
+                val renderTime = System.currentTimeMillis() - startTimeRender
+                log("C++ completado en ${renderTime} ms. Tamaño del flujo: ${printData.size} bytes (${printData.size / 1024} KB).")
+
+                // 3. Transmisión del flujo binario a través de USB OTG
                 val chunkSize = 16384
                 var offset = 0
-                val startTime = System.currentTimeMillis()
+                val startTimeTransfer = System.currentTimeMillis()
 
-                log("--- ENVIANDO A LA IMPRESORA ---")
+                log("--- TRANSMITIENDO FLUJO NATIVO A LA BROTHER ---")
 
                 while (offset < printData.size) {
                     val length = Math.min(chunkSize, printData.size - offset)
@@ -217,148 +268,24 @@ class MainActivity : AppCompatActivity() {
 
                     val transferred = connection.bulkTransfer(outEndpoint, buffer, length, 5000)
                     if (transferred < 0) {
-                        log("ERROR: bulkTransfer falló en byte $offset.")
+                        log("ERROR: bulkTransfer devolvió $transferred en el byte $offset.")
                         break
                     }
                     offset += transferred
                 }
 
-                val endTime = System.currentTimeMillis()
-                log("--- TRANSFERENCIA COMPLETADA (${endTime - startTime} ms) ---")
+                val transferTime = System.currentTimeMillis() - startTimeTransfer
+                log("--- TRANSMISIÓN FINALIZADA (${transferTime} ms) ---")
+                log("Total transferido: $offset bytes.")
 
                 connection.releaseInterface(usbInterface)
                 connection.close()
-                log("Puerto cerrado. Comprobando salida...")
+                log("Puerto USB cerrado. Comprobando salida en la impresora...")
 
             } catch (e: Throwable) {
-                log("EXCEPCIÓN: ${e.message}")
+                log("EXCEPCIÓN CRÍTICA: ${e.message}")
             }
         }
-    }
-
-    private fun encodeLineLiteralSafe(lineBuffer: ByteArray): ByteArray {
-        val out = ByteArrayOutputStream()
-        var pos = 0
-        while (pos < lineBuffer.size) {
-            val chunk = Math.min(64, lineBuffer.size - pos)
-            out.write(chunk - 1) // Modo literal 0..63
-            out.write(lineBuffer, pos, chunk)
-            pos += chunk
-        }
-        return out.toByteArray()
-    }
-
-    private fun flushBlock(stream: ByteArrayOutputStream, blockBuffer: ByteArrayOutputStream, numLines: Int) {
-        if (numLines <= 0) return
-        val data = blockBuffer.toByteArray()
-        stream.write(0x40) // '@'
-        stream.write((data.size shr 8) and 0xFF)
-        stream.write(data.size and 0xFF)
-        stream.write(numLines and 0xFF)
-        stream.write(data)
-        blockBuffer.reset()
-    }
-
-    private fun generateRealBrlaserStream(): ByteArray {
-        val stream = ByteArrayOutputStream()
-
-        // 1. Cabecera PJL
-        val jobHeader = "\u001b%-12345X@PJL\n" +
-                "@PJL JOB NAME=\"brlaser\"\n" +
-                "@PJL SET RESOLUTION = 600\n" +
-                "@PJL SET PAPER = A4\n" +
-                "@PJL ENTER LANGUAGE = PCL\n"
-        stream.write(jobHeader.toByteArray(Charsets.US_ASCII))
-
-        // 2. Cabecera PCL combinada:
-        // ESC E       -> Reset PCL
-        // ESC & l 26A -> Papel A4
-        // ESC & l 0O  -> Portrait
-        // ESC & l 0E  -> Margen superior 0
-        // ESC * t 600 R -> 600 DPI
-        // ESC * r 1 A -> ¡INICIO GRÁFICOS RASTER! (Evita desbordar a 5 páginas)
-        // ESC * b 1027 M -> MODO PROPIETARIO BROTHER
-        val pageHeader = "\u001bE" +
-                "\u001b&l26a0o0E" +
-                "\u001b*t600R" +
-                "\u001b*r1A" +
-                "\u001b*b1027M"
-        stream.write(pageHeader.toByteArray(Charsets.US_ASCII))
-
-        val width = 4736        // 592 bytes por línea
-        val totalHeight = 1200  // Altura del bloque visible
-        val bytesPerLine = width / 8
-
-        val bitmap = Bitmap.createBitmap(width, totalHeight, Bitmap.Config.RGB_565)
-        val canvas = android.graphics.Canvas(bitmap)
-        canvas.drawColor(Color.WHITE)
-
-        val paint = Paint().apply {
-            color = Color.BLACK
-            isAntiAlias = false
-        }
-
-        // Bloque visual claro: rectángulo sólido + textos
-        canvas.drawRect(200f, 150f, 4500f, 400f, paint)
-
-        paint.color = Color.WHITE
-        paint.textSize = 140f
-        paint.typeface = Typeface.DEFAULT_BOLD
-        canvas.drawText("PANADERÍA JOGARI", 300f, 330f, paint)
-
-        paint.color = Color.BLACK
-        paint.textSize = 100f
-        canvas.drawText("Prueba brlaser 1027M con Raster Activo", 200f, 580f, paint)
-        paint.textSize = 80f
-        canvas.drawText("Brother HL-L2310D OK", 200f, 720f, paint)
-
-        canvas.drawRect(200f, 800f, 4500f, 840f, paint)
-
-        val pixels = IntArray(width)
-        val blockBuffer = ByteArrayOutputStream()
-        var linesInBlock = 0
-
-        // 3. Empaquetar líneas en bloques 0x40 (25 líneas por bloque)
-        for (y in 0 until totalHeight) {
-            bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
-
-            val lineBuffer = ByteArray(bytesPerLine)
-            var currentByte = 0
-            var bitIndex = 7
-            var bytePos = 0
-
-            for (x in 0 until width) {
-                val pixel = pixels[x]
-                val lum = (Color.red(pixel) * 0.299 + Color.green(pixel) * 0.587 + Color.blue(pixel) * 0.114).toInt()
-                if (lum < 128) {
-                    currentByte = currentByte or (1 shl bitIndex)
-                }
-                bitIndex--
-                if (bitIndex < 0) {
-                    lineBuffer[bytePos++] = currentByte.toByte()
-                    currentByte = 0
-                    bitIndex = 7
-                }
-            }
-
-            val encodedLine = encodeLineLiteralSafe(lineBuffer)
-            blockBuffer.write(encodedLine)
-            linesInBlock++
-
-            if (linesInBlock == 25) {
-                flushBlock(stream, blockBuffer, linesInBlock)
-                linesInBlock = 0
-            }
-        }
-
-        flushBlock(stream, blockBuffer, linesInBlock)
-        bitmap.recycle()
-
-        // 4. Salida de modo gráfico (ESC * r B), expulsión (Form Feed 0x0C) y salida de 1027M
-        val footer = "\u001b*rB\u000c\u001b*b0M\u001b%-12345X@PJL EOJ\n\u001b%-12345X"
-        stream.write(footer.toByteArray(Charsets.US_ASCII))
-
-        return stream.toByteArray()
     }
 
     override fun onDestroy() {
