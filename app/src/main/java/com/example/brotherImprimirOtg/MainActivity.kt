@@ -43,13 +43,12 @@ class MainActivity : AppCompatActivity() {
                     if (intent.getBooleanExtra(UsbManager.EXTRA_PERMISSION_GRANTED, false)) {
                         device?.let {
                             printerDevice = it
-                            // Con permiso ya se puede leer el nombre de forma segura
                             val name = try { it.productName ?: "Brother HL-L2310D" } catch (e: Exception) { "Impresora USB" }
-                            tvStatus.text = "Conectado a:\n$name\n(Vendor: ${it.vendorId}, Product: ${it.productId})"
+                            tvStatus.text = "Conectado a:\n$name"
                             btnPrintTest.isEnabled = true
                         }
                     } else {
-                        tvStatus.text = "Permiso USB denegado por el usuario"
+                        tvStatus.text = "Permiso USB denegado"
                     }
                 }
             }
@@ -95,20 +94,6 @@ class MainActivity : AppCompatActivity() {
         registerReceiver(usbReceiver, filter, flags)
     }
 
-    private fun isPrinterDevice(device: UsbDevice): Boolean {
-        // Brother Vendor ID = 1115 (0x04F9)
-        if (device.vendorId == 1115) return true
-
-        // Verificar si declara clase impresora (USB_CLASS_PRINTER = 7)
-        for (i in 0 until device.interfaceCount) {
-            val iface = device.getInterface(i)
-            if (iface.interfaceClass == UsbConstants.USB_CLASS_PRINTER) {
-                return true
-            }
-        }
-        return false
-    }
-
     private fun findPrinter() {
         try {
             val deviceList = usbManager.deviceList
@@ -119,15 +104,19 @@ class MainActivity : AppCompatActivity() {
                 return
             }
 
-            // Buscar la impresora Brother o dispositivo de clase impresora
             for (device in deviceList.values) {
-                if (isPrinterDevice(device)) {
+                if (device.vendorId == 1115 || device.deviceClass == UsbConstants.USB_CLASS_PRINTER) {
                     printerDevice = device
                     break
                 }
+                for (i in 0 until device.interfaceCount) {
+                    if (device.getInterface(i).interfaceClass == UsbConstants.USB_CLASS_PRINTER) {
+                        printerDevice = device
+                        break
+                    }
+                }
             }
 
-            // Si hay un único dispositivo conectado, seleccionarlo
             if (printerDevice == null && deviceList.size == 1) {
                 printerDevice = deviceList.values.first()
             }
@@ -135,36 +124,27 @@ class MainActivity : AppCompatActivity() {
             val device = printerDevice
             if (device != null) {
                 if (!usbManager.hasPermission(device)) {
-                    // Corrección para Android 14: especificar el paquete en el Intent
-                    val intent = Intent(ACTION_USB_PERMISSION).apply {
-                        setPackage(packageName)
-                    }
-                    val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        PendingIntent.FLAG_MUTABLE
-                    } else {
-                        0
-                    }
+                    val intent = Intent(ACTION_USB_PERMISSION).apply { setPackage(packageName) }
+                    val flags = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) PendingIntent.FLAG_MUTABLE else 0
                     val permissionIntent = PendingIntent.getBroadcast(this, 0, intent, flags)
-                    
                     usbManager.requestPermission(device, permissionIntent)
-                    tvStatus.text = "Acepta el mensaje emergente en pantalla para permitir el acceso USB..."
+                    tvStatus.text = "Acepta el mensaje emergente en pantalla..."
                 } else {
                     val name = try { device.productName ?: "Brother" } catch (e: Exception) { "Impresora" }
-                    tvStatus.text = "Impresora lista:\n$name\n(ID: ${device.vendorId}:${device.productId})"
+                    tvStatus.text = "Impresora lista:\n$name"
                     btnPrintTest.isEnabled = true
                 }
             } else {
-                tvStatus.text = "Dispositivos conectados:\n${deviceList.size} encontrados (ninguno identificado como impresora)"
+                tvStatus.text = "No se reconoció ninguna impresora Brother."
             }
         } catch (e: Throwable) {
-            // Si ocurriera cualquier error, se muestra en pantalla sin cerrar la aplicación
-            tvStatus.text = "Error al detectar:\n${e.javaClass.simpleName}: ${e.message}"
+            tvStatus.text = "Error al detectar:\n${e.message}"
         }
     }
 
     private fun printTestPage() {
         val device = printerDevice ?: return
-        tvStatus.text = "Generando mapa de bits y enviando a la impresora..."
+        tvStatus.text = "Procesando página A4 a 300 DPI..."
 
         thread {
             try {
@@ -186,7 +166,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 if (usbInterface == null || outEndpoint == null) {
-                    runOnUiThread { tvStatus.text = "Error: No se encontró puerto de envío (BULK OUT)." }
+                    runOnUiThread { tvStatus.text = "Error: Endpoint USB de salida no encontrado." }
                     return@thread
                 }
 
@@ -197,9 +177,14 @@ class MainActivity : AppCompatActivity() {
 
                 connection.claimInterface(usbInterface, true)
 
-                val bitmap = createTestPageBitmap()
-                val printData = encodeBitmapToBrotherRaster(bitmap)
+                // 1. Crear documento A4 exacto a 300 DPI (2480 x 3508 px)
+                val bitmap = createA4TestPageBitmap()
+                // 2. Codificar con encabezado PJL y protocolo Brother Laser
+                val printData = encodeA4ToBrotherLaser(bitmap)
 
+                runOnUiThread { tvStatus.text = "Enviando datos a la impresora..." }
+
+                // 3. Enviar flujo de bytes por USB
                 val chunkSize = 4096
                 var offset = 0
                 while (offset < printData.size) {
@@ -209,7 +194,7 @@ class MainActivity : AppCompatActivity() {
 
                     val transferred = connection.bulkTransfer(outEndpoint, buffer, length, 5000)
                     if (transferred < 0) {
-                        runOnUiThread { tvStatus.text = "Fallo durante la transferencia de datos USB." }
+                        runOnUiThread { tvStatus.text = "Fallo de transferencia USB." }
                         break
                     }
                     offset += length
@@ -219,8 +204,8 @@ class MainActivity : AppCompatActivity() {
                 connection.close()
 
                 runOnUiThread {
-                    tvStatus.text = "¡Página enviada con éxito!\nRevisa la bandeja de la impresora."
-                    Toast.makeText(this@MainActivity, "Impresión completada", Toast.LENGTH_LONG).show()
+                    tvStatus.text = "¡Página enviada correctamente!\nComprueba la bandeja."
+                    Toast.makeText(this@MainActivity, "Trabajo enviado", Toast.LENGTH_LONG).show()
                 }
 
             } catch (e: Throwable) {
@@ -229,68 +214,88 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun createTestPageBitmap(): Bitmap {
-        val width = 1200
-        val height = 1600
+    private fun createA4TestPageBitmap(): Bitmap {
+        // Tamaño A4 estándar a 300 DPI
+        val width = 2480
+        val height = 3508
         val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
         val canvas = android.graphics.Canvas(bitmap)
         canvas.drawColor(Color.WHITE)
 
         val paint = Paint().apply {
             color = Color.BLACK
-            textSize = 46f
+            textSize = 70f
             isAntiAlias = true
         }
 
-        canvas.drawText("IMPRESIÓN DIRECTA OTG", 80f, 180f, paint)
-        paint.textSize = 30f
-        canvas.drawText("Modelo: Brother HL-L2310D", 80f, 260f, paint)
-        canvas.drawText("FacturaScripts - Conexión OTG OK", 80f, 320f, paint)
+        canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 200f, 400f, paint)
+        paint.textSize = 50f
+        canvas.drawText("Impresión Directa OTG - FacturaScripts", 200f, 520f, paint)
+        paint.textSize = 40f
+        canvas.drawText("Modelo: Brother HL-L2310D (Láser GDI)", 200f, 620f, paint)
+        canvas.drawText("Resolución: 300 DPI Monocromo OK", 200f, 700f, paint)
+
+        // Línea divisoria decorativa
+        paint.strokeWidth = 5f
+        canvas.drawLine(200f, 760f, 2280f, 760f, paint)
+
         return bitmap
     }
 
-    private fun encodeBitmapToBrotherRaster(bitmap: Bitmap): ByteArray {
+    private fun encodeA4ToBrotherLaser(bitmap: Bitmap): ByteArray {
         val stream = ByteArrayOutputStream()
-        stream.write(byteArrayOf(0x1B, 0x40)) // ESC @ (Reset)
-        stream.write(byteArrayOf(0x1B, 0x69, 0x61, 0x01)) // Entrar en modo Raster Brother
 
-        val width = bitmap.width
-        val height = bitmap.height
-        val bytesPerLine = (width + 7) / 8
+        // 1. Encabezado PJL: Activa el procesador RASTER de Brother a 300 DPI en A4
+        val pjlHeader = "\u001b%-12345X@PJL\r\n" +
+                "@PJL SET RESOLUTION = 300\r\n" +
+                "@PJL SET MEDIASIZE = A4\r\n" +
+                "@PJL ENTER LANGUAGE = RASTER\r\n"
+        stream.write(pjlHeader.toByteArray(Charsets.US_ASCII))
 
+        val width = bitmap.width // 2480 px
+        val height = bitmap.height // 3508 px
+        val bytesPerLine = width / 8 // 310 bytes exactos
+
+        val pixels = IntArray(width)
+
+        // 2. Transmitir cada línea con el comando de Brother Laser: 'w' (0x77) + longitud (2 bytes Little Endian)
         for (y in 0 until height) {
+            bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
+
             val lineBuffer = ByteArray(bytesPerLine)
             var currentByte = 0
             var bitIndex = 7
+            var bytePos = 0
 
             for (x in 0 until width) {
-                val pixel = bitmap.getPixel(x, y)
+                val pixel = pixels[x]
                 val lum = (Color.red(pixel) * 0.299 + Color.green(pixel) * 0.587 + Color.blue(pixel) * 0.114).toInt()
 
+                // Si el píxel es negro, activamos el bit (1 = tóner)
                 if (lum < 128) {
                     currentByte = currentByte or (1 shl bitIndex)
                 }
 
                 bitIndex--
                 if (bitIndex < 0) {
-                    lineBuffer[x / 8] = currentByte.toByte()
+                    lineBuffer[bytePos++] = currentByte.toByte()
                     currentByte = 0
                     bitIndex = 7
                 }
             }
-            if (bitIndex != 7) {
-                lineBuffer[bytesPerLine - 1] = currentByte.toByte()
-            }
 
-            stream.write(0x67) // Comando 'g' (enviar línea raster)
-            stream.write(0x00)
+            // Comando 'w' (0x77) de línea raster sin comprimir para Brother HL
+            stream.write(0x77)
             stream.write(bytesPerLine and 0xFF)
             stream.write((bytesPerLine shr 8) and 0xFF)
             stream.write(lineBuffer)
         }
 
-        stream.write(0x0C) // Form Feed (expulsar papel)
-        stream.write(byteArrayOf(0x1B, 0x69, 0x61, 0x00)) // Salir de modo Raster
+        // 3. Expulsar papel (Form Feed) y cerrar trabajo PJL
+        stream.write(0x0C)
+        val pjlFooter = "\u001b%-12345X"
+        stream.write(pjlFooter.toByteArray(Charsets.US_ASCII))
+
         return stream.toByteArray()
     }
 
