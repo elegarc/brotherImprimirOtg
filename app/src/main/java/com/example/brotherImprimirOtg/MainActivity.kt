@@ -144,7 +144,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun printTestPage() {
         val device = printerDevice ?: return
-        tvStatus.text = "Procesando página A4 a 300 DPI..."
+        tvStatus.text = "Generando flujo láser a 600 DPI con PackBits..."
 
         thread {
             try {
@@ -177,14 +177,10 @@ class MainActivity : AppCompatActivity() {
 
                 connection.claimInterface(usbInterface, true)
 
-                // 1. Crear documento A4 exacto a 300 DPI (2480 x 3508 px)
-                val bitmap = createA4TestPageBitmap()
-                // 2. Codificar con encabezado PJL y protocolo Brother Laser
-                val printData = encodeA4ToBrotherLaser(bitmap)
+                val printData = generateBrotherLaserStream()
 
-                runOnUiThread { tvStatus.text = "Enviando datos a la impresora..." }
+                runOnUiThread { tvStatus.text = "Enviando datos al motor de impresión..." }
 
-                // 3. Enviar flujo de bytes por USB
                 val chunkSize = 4096
                 var offset = 0
                 while (offset < printData.size) {
@@ -204,8 +200,8 @@ class MainActivity : AppCompatActivity() {
                 connection.close()
 
                 runOnUiThread {
-                    tvStatus.text = "¡Página enviada correctamente!\nComprueba la bandeja."
-                    Toast.makeText(this@MainActivity, "Trabajo enviado", Toast.LENGTH_LONG).show()
+                    tvStatus.text = "¡Trabajo enviado! La impresora debería comenzar a imprimir."
+                    Toast.makeText(this@MainActivity, "Comando enviado", Toast.LENGTH_LONG).show()
                 }
 
             } catch (e: Throwable) {
@@ -214,66 +210,62 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun createA4TestPageBitmap(): Bitmap {
-        // Tamaño A4 estándar a 300 DPI
-        val width = 2480
-        val height = 3508
-        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    private fun generateBrotherLaserStream(): ByteArray {
+        val stream = ByteArrayOutputStream()
+
+        // 1. Cabecera PJL a 600 DPI nativos
+        val pjlHeader = "\u001b%-12345X@PJL\r\n" +
+                "@PJL SET REPLOCK = OFF\r\n" +
+                "@PJL SET ECONOMODE = OFF\r\n" +
+                "@PJL SET RESOLUTION = 600\r\n" +
+                "@PJL SET MEDIASIZE = A4\r\n" +
+                "@PJL ENTER LANGUAGE = RASTER\r\n"
+        stream.write(pjlHeader.toByteArray(Charsets.US_ASCII))
+
+        val width = 4960      // Ancho A4 exacto a 600 DPI
+        val textHeight = 1200 // Cabecera con texto
+        val totalLines = 7016 // Alto A4 total a 600 DPI
+        val bytesPerLine = width / 8 // 620 bytes por fila
+
+        // 2. Dibujar texto en imagen en memoria (usando RGB_565 para no saturar la RAM de la tablet)
+        val bitmap = Bitmap.createBitmap(width, textHeight, Bitmap.Config.RGB_565)
         val canvas = android.graphics.Canvas(bitmap)
         canvas.drawColor(Color.WHITE)
 
         val paint = Paint().apply {
             color = Color.BLACK
-            textSize = 70f
+            textSize = 130f
             isAntiAlias = true
         }
 
-        canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 200f, 400f, paint)
-        paint.textSize = 50f
-        canvas.drawText("Impresión Directa OTG - FacturaScripts", 200f, 520f, paint)
-        paint.textSize = 40f
-        canvas.drawText("Modelo: Brother HL-L2310D (Láser GDI)", 200f, 620f, paint)
-        canvas.drawText("Resolución: 300 DPI Monocromo OK", 200f, 700f, paint)
+        canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 300f, 450f, paint)
+        paint.textSize = 90f
+        canvas.drawText("FacturaScripts - Conexión OTG OK", 300f, 650f, paint)
+        paint.textSize = 75f
+        canvas.drawText("Modelo: Brother HL-L2310D (600 DPI PackBits)", 300f, 820f, paint)
 
-        // Línea divisoria decorativa
-        paint.strokeWidth = 5f
-        canvas.drawLine(200f, 760f, 2280f, 760f, paint)
-
-        return bitmap
-    }
-
-    private fun encodeA4ToBrotherLaser(bitmap: Bitmap): ByteArray {
-        val stream = ByteArrayOutputStream()
-
-        // 1. Encabezado PJL: Activa el procesador RASTER de Brother a 300 DPI en A4
-        val pjlHeader = "\u001b%-12345X@PJL\r\n" +
-                "@PJL SET RESOLUTION = 300\r\n" +
-                "@PJL SET MEDIASIZE = A4\r\n" +
-                "@PJL ENTER LANGUAGE = RASTER\r\n"
-        stream.write(pjlHeader.toByteArray(Charsets.US_ASCII))
-
-        val width = bitmap.width // 2480 px
-        val height = bitmap.height // 3508 px
-        val bytesPerLine = width / 8 // 310 bytes exactos
+        paint.strokeWidth = 10f
+        canvas.drawLine(300f, 950f, 4660f, 950f, paint)
 
         val pixels = IntArray(width)
 
-        // 2. Transmitir cada línea con el comando de Brother Laser: 'w' (0x77) + longitud (2 bytes Little Endian)
-        for (y in 0 until height) {
+        // 3. Procesar las líneas de la cabecera
+        for (y in 0 until textHeight) {
             bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
 
             val lineBuffer = ByteArray(bytesPerLine)
             var currentByte = 0
             var bitIndex = 7
             var bytePos = 0
+            var isBlank = true
 
             for (x in 0 until width) {
                 val pixel = pixels[x]
                 val lum = (Color.red(pixel) * 0.299 + Color.green(pixel) * 0.587 + Color.blue(pixel) * 0.114).toInt()
 
-                // Si el píxel es negro, activamos el bit (1 = tóner)
                 if (lum < 128) {
                     currentByte = currentByte or (1 shl bitIndex)
+                    isBlank = false
                 }
 
                 bitIndex--
@@ -284,14 +276,37 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // Comando 'w' (0x77) de línea raster sin comprimir para Brother HL
-            stream.write(0x77)
-            stream.write(bytesPerLine and 0xFF)
-            stream.write((bytesPerLine shr 8) and 0xFF)
-            stream.write(lineBuffer)
+            if (isBlank) {
+                // Comando 'z' (0x7A): línea en blanco instantánea
+                stream.write(0x7A)
+            } else {
+                // Compresión PackBits estándar en bloques de hasta 128 bytes
+                val packbitsStream = ByteArrayOutputStream()
+                var pos = 0
+                while (pos < bytesPerLine) {
+                    val chunkSize = Math.min(128, bytesPerLine - pos)
+                    packbitsStream.write(chunkSize - 1) // Cabecera literal PackBits
+                    packbitsStream.write(lineBuffer, pos, chunkSize)
+                    pos += chunkSize
+                }
+                val packedData = packbitsStream.toByteArray()
+
+                // Comando 'w' (0x77) + longitud (Little Endian) + datos PackBits
+                stream.write(0x77)
+                stream.write(packedData.size and 0xFF)
+                stream.write((packedData.size shr 8) and 0xFF)
+                stream.write(packedData)
+            }
         }
 
-        // 3. Expulsar papel (Form Feed) y cerrar trabajo PJL
+        bitmap.recycle()
+
+        // 4. Completar el resto del folio A4 con saltos de línea vacíos
+        for (y in textHeight until totalLines) {
+            stream.write(0x7A)
+        }
+
+        // 5. Expulsar papel (Form Feed) y cerrar trabajo
         stream.write(0x0C)
         val pjlFooter = "\u001b%-12345X"
         stream.write(pjlFooter.toByteArray(Charsets.US_ASCII))
