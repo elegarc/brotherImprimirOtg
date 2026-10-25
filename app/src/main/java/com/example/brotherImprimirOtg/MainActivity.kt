@@ -144,7 +144,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun printTestPage() {
         val device = printerDevice ?: return
-        tvStatus.text = "Generando flujo láser a 600 DPI con PackBits..."
+        tvStatus.text = "Generando flujo A4 (4736 px / 592 bytes)..."
 
         thread {
             try {
@@ -200,7 +200,7 @@ class MainActivity : AppCompatActivity() {
                 connection.close()
 
                 runOnUiThread {
-                    tvStatus.text = "¡Trabajo enviado! La impresora debería comenzar a imprimir."
+                    tvStatus.text = "¡Trabajo enviado! Procesando impresión..."
                     Toast.makeText(this@MainActivity, "Comando enviado", Toast.LENGTH_LONG).show()
                 }
 
@@ -213,43 +213,41 @@ class MainActivity : AppCompatActivity() {
     private fun generateBrotherLaserStream(): ByteArray {
         val stream = ByteArrayOutputStream()
 
-        // 1. Cabecera PJL a 600 DPI nativos
+        // 1. Cabecera PJL estricta con delimitador de trabajo JOB
         val pjlHeader = "\u001b%-12345X@PJL\r\n" +
-                "@PJL SET REPLOCK = OFF\r\n" +
-                "@PJL SET ECONOMODE = OFF\r\n" +
+                "@PJL JOB NAME = \"PRUEBA\"\r\n" +
                 "@PJL SET RESOLUTION = 600\r\n" +
                 "@PJL SET MEDIASIZE = A4\r\n" +
                 "@PJL ENTER LANGUAGE = RASTER\r\n"
         stream.write(pjlHeader.toByteArray(Charsets.US_ASCII))
 
-        val width = 4960      // Ancho A4 exacto a 600 DPI
-        val textHeight = 1200 // Cabecera con texto
-        val totalLines = 7016 // Alto A4 total a 600 DPI
-        val bytesPerLine = width / 8 // 620 bytes por fila
+        // Ancho máximo admisible por el hardware de Brother en A4 a 600 DPI (sin desborde)
+        val width = 4736
+        val textHeight = 1000
+        val bytesPerLine = width / 8 // 592 bytes exactos
 
-        // 2. Dibujar texto en imagen en memoria (usando RGB_565 para no saturar la RAM de la tablet)
         val bitmap = Bitmap.createBitmap(width, textHeight, Bitmap.Config.RGB_565)
         val canvas = android.graphics.Canvas(bitmap)
         canvas.drawColor(Color.WHITE)
 
         val paint = Paint().apply {
             color = Color.BLACK
-            textSize = 130f
+            textSize = 120f
             isAntiAlias = true
         }
 
-        canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 300f, 450f, paint)
-        paint.textSize = 90f
-        canvas.drawText("FacturaScripts - Conexión OTG OK", 300f, 650f, paint)
-        paint.textSize = 75f
-        canvas.drawText("Modelo: Brother HL-L2310D (600 DPI PackBits)", 300f, 820f, paint)
+        canvas.drawText("PANADERÍA Y PASTELERÍA JOGARI", 200f, 350f, paint)
+        paint.textSize = 80f
+        canvas.drawText("FacturaScripts - Conexión OTG OK", 200f, 520f, paint)
+        paint.textSize = 65f
+        canvas.drawText("Modelo: Brother HL-L2310D (600 DPI / 592 bytes)", 200f, 660f, paint)
 
-        paint.strokeWidth = 10f
-        canvas.drawLine(300f, 950f, 4660f, 950f, paint)
+        paint.strokeWidth = 8f
+        canvas.drawLine(200f, 760f, 4500f, 760f, paint)
 
         val pixels = IntArray(width)
 
-        // 3. Procesar las líneas de la cabecera
+        // 2. Transmisión de las líneas con datos en bruto (Raw 592 bytes)
         for (y in 0 until textHeight) {
             bitmap.getPixels(pixels, 0, width, 0, y, width, 1)
 
@@ -257,7 +255,6 @@ class MainActivity : AppCompatActivity() {
             var currentByte = 0
             var bitIndex = 7
             var bytePos = 0
-            var isBlank = true
 
             for (x in 0 until width) {
                 val pixel = pixels[x]
@@ -265,7 +262,6 @@ class MainActivity : AppCompatActivity() {
 
                 if (lum < 128) {
                     currentByte = currentByte or (1 shl bitIndex)
-                    isBlank = false
                 }
 
                 bitIndex--
@@ -276,39 +272,18 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            if (isBlank) {
-                // Comando 'z' (0x7A): línea en blanco instantánea
-                stream.write(0x7A)
-            } else {
-                // Compresión PackBits estándar en bloques de hasta 128 bytes
-                val packbitsStream = ByteArrayOutputStream()
-                var pos = 0
-                while (pos < bytesPerLine) {
-                    val chunkSize = Math.min(128, bytesPerLine - pos)
-                    packbitsStream.write(chunkSize - 1) // Cabecera literal PackBits
-                    packbitsStream.write(lineBuffer, pos, chunkSize)
-                    pos += chunkSize
-                }
-                val packedData = packbitsStream.toByteArray()
-
-                // Comando 'w' (0x77) + longitud (Little Endian) + datos PackBits
-                stream.write(0x77)
-                stream.write(packedData.size and 0xFF)
-                stream.write((packedData.size shr 8) and 0xFF)
-                stream.write(packedData)
-            }
+            // Comando 'w' (0x77) + longitud fija de 592 bytes (Little Endian: 0x50, 0x02)
+            stream.write(0x77)
+            stream.write(bytesPerLine and 0xFF)
+            stream.write((bytesPerLine shr 8) and 0xFF)
+            stream.write(lineBuffer)
         }
 
         bitmap.recycle()
 
-        // 4. Completar el resto del folio A4 con saltos de línea vacíos
-        for (y in textHeight until totalLines) {
-            stream.write(0x7A)
-        }
-
-        // 5. Expulsar papel (Form Feed) y cerrar trabajo
+        // 3. Expulsar papel (0x0C) y cerrar formalmente el trabajo PJL con EOJ
         stream.write(0x0C)
-        val pjlFooter = "\u001b%-12345X"
+        val pjlFooter = "\u001b%-12345X@PJL EOJ\r\n\u001b%-12345X"
         stream.write(pjlFooter.toByteArray(Charsets.US_ASCII))
 
         return stream.toByteArray()
